@@ -76,6 +76,8 @@ public class Peripheral extends BluetoothGattCallback {
     private CallbackContext requestMtuCallback;
     private CallbackContext bondStateCallback;
     private Activity currentActivity;
+    private int lastDisconnectStatus = Integer.MIN_VALUE;
+    private int lastDisconnectState = Integer.MIN_VALUE;
 
     private final Map<String, SequentialCallbackContext> notificationCallbacks = new HashMap<String, SequentialCallbackContext>();
 
@@ -356,6 +358,12 @@ public class Peripheral extends BluetoothGattCallback {
             json.put("name", device.getName());
             json.put("id", device.getAddress()); // mac address
             json.put("errorMessage", errorMessage);
+            if (lastDisconnectStatus != Integer.MIN_VALUE) {
+                json.put("status", lastDisconnectStatus);
+            }
+            if (lastDisconnectState != Integer.MIN_VALUE) {
+                json.put("state", lastDisconnectState);
+            }
         } catch (JSONException e) { // this shouldn't happen
             e.printStackTrace();
         }
@@ -484,6 +492,8 @@ public class Peripheral extends BluetoothGattCallback {
             LOG.d(TAG, "onConnectionStateChange CONNECTED status=%d gatt=%s", status, gattRef(gatt));
             connected = true;
             connecting = false;
+            lastDisconnectStatus = Integer.MIN_VALUE;
+            lastDisconnectState = Integer.MIN_VALUE;
             if (!gatt.discoverServices()) {
                 LOG.e(TAG, "discoverServices failed gatt=%s", gattRef(gatt));
                 peripheralDisconnected("Service discovery start failed");
@@ -493,6 +503,8 @@ public class Peripheral extends BluetoothGattCallback {
             LOG.d(TAG, "onConnectionStateChange DISCONNECTED status=%d state=%d gatt=%s",
                 status, newState, gattRef(gatt));
             connected = false;
+            lastDisconnectStatus = status;
+            lastDisconnectState = newState;
             peripheralDisconnected("Peripheral Disconnected status=" + status + " state=" + newState);
 
         }
