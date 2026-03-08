@@ -19,8 +19,10 @@ import android.annotation.TargetApi;
 import android.app.Activity;
 
 import android.bluetooth.*;
+import android.content.Context;
 import android.os.Build;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.util.Base64;
 import org.apache.cordova.CallbackContext;
 import org.apache.cordova.LOG;
@@ -76,6 +78,8 @@ public class Peripheral extends BluetoothGattCallback {
     private CallbackContext requestMtuCallback;
     private CallbackContext bondStateCallback;
     private Activity currentActivity;
+    private HandlerThread gattCallbackThread;
+    private Handler gattCallbackHandler;
     private int lastDisconnectStatus = Integer.MIN_VALUE;
     private int lastDisconnectState = Integer.MIN_VALUE;
 
@@ -108,6 +112,35 @@ public class Peripheral extends BluetoothGattCallback {
         }
     }
 
+    private synchronized Handler getGattCallbackHandler() {
+        if (gattCallbackThread == null) {
+            String suffix = device != null ? device.getAddress().replace(":", "") : "unknown";
+            gattCallbackThread = new HandlerThread("BLEGatt-" + suffix);
+            gattCallbackThread.start();
+            gattCallbackHandler = new Handler(gattCallbackThread.getLooper());
+        }
+        return gattCallbackHandler;
+    }
+
+    private synchronized void shutdownGattCallbackThread() {
+        if (gattCallbackThread == null) {
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2) {
+            gattCallbackThread.quitSafely();
+        } else {
+            gattCallbackThread.quit();
+        }
+        gattCallbackThread = null;
+        gattCallbackHandler = null;
+    }
+
+    private void clearNotificationCallbacks() {
+        synchronized (notificationCallbacks) {
+            notificationCallbacks.clear();
+        }
+    }
+
     @RequiresPermission("android.permission.BLUETOOTH_CONNECT")
     private boolean gattConnect() {
 
@@ -118,7 +151,20 @@ public class Peripheral extends BluetoothGattCallback {
         callbackCleanup("Aborted by new connect call");
 
         BluetoothDevice device = getDevice();
-        BluetoothGatt newGatt = device.connectGatt(currentActivity, autoconnect, this, BluetoothDevice.TRANSPORT_LE);
+        Context context = currentActivity != null ? currentActivity.getApplicationContext() : null;
+        if (context == null) {
+            LOG.e(TAG, "connectGatt aborted: context is null");
+            connecting = false;
+            return false;
+        }
+        Handler callbackHandler = getGattCallbackHandler();
+        BluetoothGatt newGatt;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            newGatt = device.connectGatt(context, autoconnect, this,
+                BluetoothDevice.TRANSPORT_LE, BluetoothDevice.PHY_LE_1M_MASK, callbackHandler);
+        } else {
+            newGatt = device.connectGatt(context, autoconnect, this, BluetoothDevice.TRANSPORT_LE);
+        }
         synchronized (this) {
             gatt = newGatt;
         }
@@ -185,10 +231,12 @@ public class Peripheral extends BluetoothGattCallback {
             localGatt = this.gatt;
             this.gatt = null;
         }
+        clearNotificationCallbacks();
         if (localGatt != null) {
             localGatt.disconnect();
             localGatt.close();
         }
+        shutdownGattCallbackThread();
     }
 
     // notify the phone that the peripheral disconnected
@@ -283,24 +331,50 @@ public class Peripheral extends BluetoothGattCallback {
         LOG.d(TAG, "refreshDeviceCache");
 
         boolean success = false;
-        if (gatt != null) {
+        final BluetoothGatt targetGatt;
+        synchronized (this) {
+            targetGatt = gatt;
+        }
+        if (targetGatt != null) {
             try {
-                final Method refresh = gatt.getClass().getMethod("refresh");
+                final Method refresh = targetGatt.getClass().getMethod("refresh");
                 if (refresh != null) {
-                    success = (Boolean)refresh.invoke(gatt);
+                    success = (Boolean)refresh.invoke(targetGatt);
                     if (success) {
                         this.refreshCallback = callback;
-                        Handler handler = new Handler();
+                        Handler handler = getGattCallbackHandler();
                         LOG.d(TAG, "Waiting " + timeoutMillis + " milliseconds before discovering services");
                         handler.postDelayed(new Runnable() {
                             @SuppressLint("MissingPermission")
                             @Override
                             public void run() {
-                                if (gatt != null) {
-                                    try {
-                                        gatt.discoverServices();
-                                    } catch(Exception e) {
-                                        LOG.e(TAG, "refreshDeviceCache Failed after delay", e);
+                                if (!isCurrentGatt(targetGatt)) {
+                                    LOG.w(TAG, "refreshDeviceCache stale gatt=%s current=%s", gattRef(targetGatt), gattRef(gatt));
+                                    synchronized (Peripheral.this) {
+                                        if (refreshCallback != null) {
+                                            refreshCallback.error("Service refresh aborted");
+                                            refreshCallback = null;
+                                        }
+                                    }
+                                    return;
+                                }
+                                try {
+                                    if (!targetGatt.discoverServices()) {
+                                        LOG.e(TAG, "refreshDeviceCache discoverServices failed gatt=%s", gattRef(targetGatt));
+                                        synchronized (Peripheral.this) {
+                                            if (refreshCallback != null) {
+                                                refreshCallback.error("Service discovery start failed");
+                                                refreshCallback = null;
+                                            }
+                                        }
+                                    }
+                                } catch(Exception e) {
+                                    LOG.e(TAG, "refreshDeviceCache Failed after delay", e);
+                                    synchronized (Peripheral.this) {
+                                        if (refreshCallback != null) {
+                                            refreshCallback.error("Service refresh failed");
+                                            refreshCallback = null;
+                                        }
                                     }
                                 }
                             }
@@ -526,7 +600,10 @@ public class Peripheral extends BluetoothGattCallback {
 
         LOG.d(TAG, "onCharacteristicChanged %s", characteristic);
 
-        SequentialCallbackContext callback = notificationCallbacks.get(generateHashKey(characteristic));
+            SequentialCallbackContext callback;
+            synchronized (notificationCallbacks) {
+                callback = notificationCallbacks.get(generateHashKey(characteristic));
+            }
 
         if (callback != null) {
             callback.sendSequentialResult(characteristic.getValue());
@@ -543,7 +620,10 @@ public class Peripheral extends BluetoothGattCallback {
         }
         LOG.d(TAG, "onCharacteristicChanged (api:33) %s", characteristic);
 
-        SequentialCallbackContext callback = notificationCallbacks.get(generateHashKey(characteristic));
+        SequentialCallbackContext callback;
+        synchronized (notificationCallbacks) {
+            callback = notificationCallbacks.get(generateHashKey(characteristic));
+        }
 
         if (callback != null) {
             callback.sendSequentialResult(data);
@@ -640,12 +720,17 @@ public class Peripheral extends BluetoothGattCallback {
         if (descriptor.getUuid().equals(CLIENT_CHARACTERISTIC_CONFIGURATION_UUID)) {
             BluetoothGattCharacteristic characteristic = descriptor.getCharacteristic();
             String key = generateHashKey(characteristic);
-            SequentialCallbackContext callback = notificationCallbacks.get(key);
+            SequentialCallbackContext callback;
+            synchronized (notificationCallbacks) {
+                callback = notificationCallbacks.get(key);
+            }
 
             if (callback != null) {
                 boolean success = callback.completeSubscription(status);
                 if (!success) {
-                    notificationCallbacks.remove(key);
+                    synchronized (notificationCallbacks) {
+                        notificationCallbacks.remove(key);
+                    }
                 }
             }
         }
@@ -723,11 +808,15 @@ public class Peripheral extends BluetoothGattCallback {
 
         String key = generateHashKey(serviceUUID, characteristic);
 
-        notificationCallbacks.put(key, new SequentialCallbackContext(callbackContext));
+        synchronized (notificationCallbacks) {
+            notificationCallbacks.put(key, new SequentialCallbackContext(callbackContext));
+        }
 
         if (!gatt.setCharacteristicNotification(characteristic, true)) {
             callbackContext.error("Failed to register notification for " + characteristicUUID);
-            notificationCallbacks.remove(key);
+            synchronized (notificationCallbacks) {
+                notificationCallbacks.remove(key);
+            }
             commandCompleted();
             return;
         }
@@ -736,7 +825,9 @@ public class Peripheral extends BluetoothGattCallback {
         BluetoothGattDescriptor descriptor = characteristic.getDescriptor(CLIENT_CHARACTERISTIC_CONFIGURATION_UUID);
         if (descriptor == null) {
             callbackContext.error("Set notification failed for " + characteristicUUID);
-            notificationCallbacks.remove(key);
+            synchronized (notificationCallbacks) {
+                notificationCallbacks.remove(key);
+            }
             commandCompleted();
             return;
         }
@@ -750,7 +841,9 @@ public class Peripheral extends BluetoothGattCallback {
         } else {
             LOG.w(TAG, "Characteristic %s does not have NOTIFY or INDICATE property set", characteristicUUID);
             callbackContext.error("Set notification failed for " + characteristicUUID + "(missing NOTIFY or INDICATE property)");
-            notificationCallbacks.remove(key);
+            synchronized (notificationCallbacks) {
+                notificationCallbacks.remove(key);
+            }
             commandCompleted();
             return;
         }
@@ -770,7 +863,9 @@ public class Peripheral extends BluetoothGattCallback {
         }
 
         if (!success) {
-            notificationCallbacks.remove(key);
+            synchronized (notificationCallbacks) {
+                notificationCallbacks.remove(key);
+            }
             commandCompleted();
         }
     }
@@ -802,7 +897,9 @@ public class Peripheral extends BluetoothGattCallback {
 
         String key = generateHashKey(serviceUUID, characteristic);
 
-        notificationCallbacks.remove(key);
+        synchronized (notificationCallbacks) {
+            notificationCallbacks.remove(key);
+        }
 
         if (gatt.setCharacteristicNotification(characteristic, false)) {
             BluetoothGattDescriptor descriptor = characteristic.getDescriptor(CLIENT_CHARACTERISTIC_CONFIGURATION_UUID);
@@ -1113,6 +1210,7 @@ public class Peripheral extends BluetoothGattCallback {
                 commandCompleted();
             }
         }
+        clearNotificationCallbacks();
     }
 
     // add a new command to the queue
