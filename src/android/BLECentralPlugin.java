@@ -15,6 +15,7 @@
 package com.megster.cordova.ble.central;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
@@ -54,6 +55,8 @@ import java.util.*;
 
 import static android.bluetooth.BluetoothDevice.DEVICE_TYPE_DUAL;
 import static android.bluetooth.BluetoothDevice.DEVICE_TYPE_LE;
+import static android.bluetooth.BluetoothDevice.ACTION_BOND_STATE_CHANGED;
+import static android.bluetooth.BluetoothDevice.EXTRA_BOND_STATE;
 
 public class BLECentralPlugin extends CordovaPlugin {
     // permissions
@@ -62,8 +65,6 @@ public class BLECentralPlugin extends CordovaPlugin {
     private static final String BLUETOOTH_SCAN =  "android.permission.BLUETOOTH_SCAN" ; // API 31
 
     // actions
-    private static final String SCAN = "scan";
-    private static final String START_SCAN = "startScan";
     private static final String STOP_SCAN = "stopScan";
     private static final String START_SCAN_WITH_OPTIONS = "startScanWithOptions";
     private static final String BONDED_DEVICES = "bondedDevices";
@@ -75,6 +76,9 @@ public class BLECentralPlugin extends CordovaPlugin {
 
     private static final String QUEUE_CLEANUP = "queueCleanup";
     private static final String SET_PIN = "setPin";
+    private static final String BOND = "bond";
+    private static final String UNBOND = "unbond";
+    private static final String READ_BOND_STATE = "readBondState";
 
     private static final String REQUEST_MTU = "requestMtu";
     private static final String REQUEST_CONNECTION_PRIORITY = "requestConnectionPriority";
@@ -124,23 +128,31 @@ public class BLECentralPlugin extends CordovaPlugin {
 
     // scan options
     boolean reportDuplicates = false;
+    boolean forceScanFilter = false;
 
     private static final int REQUEST_BLUETOOTH_SCAN = 2;
     private static final int REQUEST_BLUETOOTH_CONNECT = 3;
     private static final int REQUEST_BLUETOOTH_CONNECT_AUTO = 4;
     private static final int REQUEST_GET_BONDED_DEVICES = 5;
     private static final int REQUEST_LIST_KNOWN_DEVICES = 6;
+    private static final int REQUEST_BOND = 7;
+    private static final int REQUEST_UNBOND = 8;
+    private static final int REQUEST_READ_BOND_STATE = 9;
     private static int COMPILE_SDK_VERSION = -1;
     private CallbackContext permissionCallback;
     private String deviceMacAddress;
+    private boolean usePairingDialog;
     private UUID[] serviceUUIDs;
     private int scanSeconds;
     private ScanSettings scanSettings;
     private final Handler stopScanHandler = new Handler(Looper.getMainLooper());
+    private final Runnable stopScanRunnable = this::stopScan;
 
     // Bluetooth state notification
     CallbackContext stateCallback;
     BroadcastReceiver stateReceiver;
+    private BroadcastReceiver bondStateReceiver;
+
     Map<Integer, String> bluetoothStates = new Hashtable<Integer, String>() {{
         put(BluetoothAdapter.STATE_OFF, "off");
         put(BluetoothAdapter.STATE_TURNING_OFF, "turningOff");
@@ -159,19 +171,23 @@ public class BLECentralPlugin extends CordovaPlugin {
         }
     }
 
+    @SuppressLint("MissingPermission")
     @Override
     public void onDestroy() {
         removeStateListener();
         removeLocationStateListener();
+        removeBondStateListener();
         for(Peripheral peripheral : peripherals.values()) {
             peripheral.disconnect();
         }
     }
 
+    @SuppressLint("MissingPermission")
     @Override
     public void onReset() {
         removeStateListener();
         removeLocationStateListener();
+        removeBondStateListener();
         for(Peripheral peripheral : peripherals.values()) {
             peripheral.disconnect();
         }
@@ -183,7 +199,7 @@ public class BLECentralPlugin extends CordovaPlugin {
 
         if (bluetoothAdapter == null) {
             Activity activity = cordova.getActivity();
-            boolean hardwareSupportsBLE = activity.getApplicationContext()
+            @SuppressLint("ObsoleteSdkInt") boolean hardwareSupportsBLE = activity.getApplicationContext()
                     .getPackageManager()
                     .hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE) &&
                     Build.VERSION.SDK_INT >= 18;
@@ -197,21 +213,7 @@ public class BLECentralPlugin extends CordovaPlugin {
         }
 
         boolean validAction = true;
-
-        if (action.equals(SCAN)) {
-
-            UUID[] serviceUUIDs = parseServiceUUIDList(args.getJSONArray(0));
-            int scanSeconds = args.getInt(1);
-            resetScanOptions();
-            findLowEnergyDevices(callbackContext, serviceUUIDs, scanSeconds);
-
-        } else if (action.equals(START_SCAN)) {
-
-            UUID[] serviceUUIDs = parseServiceUUIDList(args.getJSONArray(0));
-            resetScanOptions();
-            findLowEnergyDevices(callbackContext, serviceUUIDs, -1);
-
-        } else if (action.equals(STOP_SCAN)) {
+        if (action.equals(STOP_SCAN)) {
             stopScan();
             callbackContext.success();
 
@@ -243,6 +245,24 @@ public class BLECentralPlugin extends CordovaPlugin {
 
             String pin = args.getString(0);
             setPin(callbackContext, pin);
+
+        } else if (action.equals(BOND)) {
+
+            String macAddress = args.getString(0);
+            JSONObject options = args.getJSONObject(1);
+
+            boolean usePairingDialog = options != null && options.optBoolean("usePairingDialog", true);
+            bond(callbackContext, macAddress, usePairingDialog);
+
+        } else if (action.equals(UNBOND)) {
+
+            String macAddress = args.getString(0);
+            unbond(callbackContext, macAddress);
+
+        } else if (action.equals(READ_BOND_STATE)) {
+
+            String macAddress = args.getString(0);
+            readBondState(callbackContext, macAddress);
 
         } else if (action.equals(REQUEST_MTU)) {
 
@@ -394,6 +414,7 @@ public class BLECentralPlugin extends CordovaPlugin {
 
             resetScanOptions();
             this.reportDuplicates = options.optBoolean("reportDuplicates", false);
+            this.forceScanFilter = options.optBoolean("forceScanFilter", false);
             ScanSettings.Builder scanSettings = new ScanSettings.Builder();
 
             switch (options.optString("scanMode", "")) {
@@ -416,86 +437,94 @@ public class BLECentralPlugin extends CordovaPlugin {
                     validAction = false;
                     break;
             }
-
-            switch (options.optString("callbackType", "")) {
-                case "":
-                    break;
-                case "all":
-                    scanSettings.setCallbackType( ScanSettings.CALLBACK_TYPE_ALL_MATCHES );
-                    break;
-                case "first":
-                    scanSettings.setCallbackType( ScanSettings.CALLBACK_TYPE_FIRST_MATCH );
-                    break;
-                case "lost":
-                    scanSettings.setCallbackType( ScanSettings.CALLBACK_TYPE_MATCH_LOST );
-                    break;
-                default:
-                    callbackContext.error("callbackType must be one of: all | first | lost");
-                    validAction = false;
-                    break;
+            if (Build.VERSION.SDK_INT >= 23) {
+                switch (options.optString("callbackType", "")) {
+                    case "":
+                        break;
+                    case "all":
+                        scanSettings.setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES);
+                        break;
+                    case "first":
+                        scanSettings.setCallbackType(ScanSettings.CALLBACK_TYPE_FIRST_MATCH);
+                        break;
+                    case "lost":
+                        scanSettings.setCallbackType(ScanSettings.CALLBACK_TYPE_MATCH_LOST);
+                        break;
+                    default:
+                        callbackContext.error("callbackType must be one of: all | first | lost");
+                        validAction = false;
+                        break;
+                }
             }
 
-            switch (options.optString("matchMode", "")) {
-                case "":
-                    break;
-                case "aggressive":
-                    scanSettings.setMatchMode( ScanSettings.MATCH_MODE_AGGRESSIVE );
-                    break;
-                case "sticky":
-                    scanSettings.setMatchMode( ScanSettings.MATCH_MODE_STICKY );
-                    break;
-                default:
-                    callbackContext.error("matchMode must be one of: aggressive | sticky");
-                    validAction = false;
-                    break;
+            if (Build.VERSION.SDK_INT >= 23) {
+                switch (options.optString("matchMode", "")) {
+                    case "":
+                        break;
+                    case "aggressive":
+                        scanSettings.setMatchMode(ScanSettings.MATCH_MODE_AGGRESSIVE);
+                        break;
+                    case "sticky":
+                        scanSettings.setMatchMode(ScanSettings.MATCH_MODE_STICKY);
+                        break;
+                    default:
+                        callbackContext.error("matchMode must be one of: aggressive | sticky");
+                        validAction = false;
+                        break;
+                }
             }
 
-            switch (options.optString("numOfMatches", "")) {
-                case "":
-                    break;
-                case "one":
-                    scanSettings.setNumOfMatches( ScanSettings.MATCH_NUM_ONE_ADVERTISEMENT );
-                    break;
-                case "few":
-                    scanSettings.setNumOfMatches( ScanSettings.MATCH_NUM_FEW_ADVERTISEMENT );
-                    break;
-                case "max":
-                    scanSettings.setNumOfMatches( ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT );
-                    break;
-                default:
-                    callbackContext.error("numOfMatches must be one of: one | few | max");
-                    validAction = false;
-                    break;
+            if (Build.VERSION.SDK_INT >= 23) {
+                switch (options.optString("numOfMatches", "")) {
+                    case "":
+                        break;
+                    case "one":
+                        scanSettings.setNumOfMatches(ScanSettings.MATCH_NUM_ONE_ADVERTISEMENT);
+                        break;
+                    case "few":
+                        scanSettings.setNumOfMatches(ScanSettings.MATCH_NUM_FEW_ADVERTISEMENT);
+                        break;
+                    case "max":
+                        scanSettings.setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT);
+                        break;
+                    default:
+                        callbackContext.error("numOfMatches must be one of: one | few | max");
+                        validAction = false;
+                        break;
+                }
             }
 
-            switch (options.optString("phy", "")) {
-                case "":
-                    break;
-                case "1m":
-                    scanSettings.setPhy( BluetoothDevice.PHY_LE_1M );
-                    break;
-                case "coded":
-                    scanSettings.setPhy( BluetoothDevice.PHY_LE_CODED );
-                    break;
-                case "all":
-                    scanSettings.setPhy( ScanSettings.PHY_LE_ALL_SUPPORTED );
-                    break;
-                default:
-                    callbackContext.error("phy must be one of: 1m | coded | all");
-                    validAction = false;
-                    break;
+            if (Build.VERSION.SDK_INT >= 26 /*O*/) {
+                switch (options.optString("phy", "")) {
+                    case "":
+                        break;
+                    case "1m":
+                        scanSettings.setPhy(BluetoothDevice.PHY_LE_1M);
+                        break;
+                    case "coded":
+                        scanSettings.setPhy(BluetoothDevice.PHY_LE_CODED);
+                        break;
+                    case "all":
+                        scanSettings.setPhy(ScanSettings.PHY_LE_ALL_SUPPORTED);
+                        break;
+                    default:
+                        callbackContext.error("phy must be one of: 1m | coded | all");
+                        validAction = false;
+                        break;
+                }
             }
 
             if (validAction) {
                 String LEGACY = "legacy";
-                if (!options.isNull(LEGACY))
+                if (Build.VERSION.SDK_INT >= 26 /*O*/ && !options.isNull(LEGACY))
                     scanSettings.setLegacy( options.getBoolean(LEGACY) );
 
                 long reportDelay = options.optLong("reportDelay", -1 );
                 if (reportDelay >= 0L)
                     scanSettings.setReportDelay( reportDelay );
 
-                findLowEnergyDevices(callbackContext, serviceUUIDs, -1, scanSettings.build() );
+                int scanDuration = options.optInt("duration", -1);
+                findLowEnergyDevices(callbackContext, serviceUUIDs, scanDuration, scanSettings.build() );
             }
 
         } else if (action.equals(BONDED_DEVICES)) {
@@ -554,6 +583,7 @@ public class BLECentralPlugin extends CordovaPlugin {
         cordova.startActivityForResult(this, intent, REQUEST_ENABLE_BLUETOOTH);
     }
 
+    @SuppressLint("MissingPermission")
     private void getBondedDevices(CallbackContext callbackContext) {
         if (COMPILE_SDK_VERSION >= 31 && Build.VERSION.SDK_INT >= 31) { // (API 31) Build.VERSION_CODE.S
             if (!PermissionHelper.hasPermission(this, BLUETOOTH_CONNECT)) {
@@ -591,6 +621,7 @@ public class BLECentralPlugin extends CordovaPlugin {
         return serviceUUIDs.toArray(new UUID[jsonArray.length()]);
     }
 
+    @SuppressLint("MissingPermission")
     private void onBluetoothStateChange(Intent intent) {
         final String action = intent.getAction();
 
@@ -598,13 +629,13 @@ public class BLECentralPlugin extends CordovaPlugin {
             final int state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR);
             sendBluetoothStateChange(state);
             if (state == BluetoothAdapter.STATE_OFF) {
-               // #894 When Bluetooth is physically turned off the whole process might die, so the normal
+                // #894 When Bluetooth is physically turned off the whole process might die, so the normal
                 // onConnectionStateChange callbacks won't be invoked
-                
+
                 BluetoothManager bluetoothManager = (BluetoothManager) cordova.getActivity().getSystemService(Context.BLUETOOTH_SERVICE);
                 for(Peripheral peripheral : peripherals.values()) {
                     if (!peripheral.isConnected()) continue;
-                    
+
                     int connectedState = bluetoothManager.getConnectionState(peripheral.getDevice(), BluetoothProfile.GATT);
                     if (connectedState == BluetoothProfile.STATE_DISCONNECTED) {
                         peripheral.peripheralDisconnected("Bluetooth Disabled");
@@ -681,7 +712,7 @@ public class BLECentralPlugin extends CordovaPlugin {
         try {
             IntentFilter intentFilter = new IntentFilter(LocationManager.PROVIDERS_CHANGED_ACTION);
             intentFilter.addAction(Intent.ACTION_PROVIDER_CHANGED);
-            webView.getContext().registerReceiver(this.locationStateReceiver, intentFilter);
+            registerNonSystemReceiverCompat(this.locationStateReceiver, intentFilter);
         } catch (Exception e) {
             LOG.e(TAG, "Error registering location state receiver: " + e.getMessage(), e);
         }
@@ -699,6 +730,7 @@ public class BLECentralPlugin extends CordovaPlugin {
         this.locationStateReceiver = null;
     }
 
+    @SuppressLint("MissingPermission")
     private void connect(CallbackContext callbackContext, String macAddress) {
         if (COMPILE_SDK_VERSION >= 31 && Build.VERSION.SDK_INT >= 31) { // (API 31) Build.VERSION_CODE.S
             if (!PermissionHelper.hasPermission(this, BLUETOOTH_CONNECT)) {
@@ -715,7 +747,7 @@ public class BLECentralPlugin extends CordovaPlugin {
             return;
         }
 
-        if (!peripherals.containsKey(macAddress) && BLECentralPlugin.this.bluetoothAdapter.checkBluetoothAddress(macAddress)) {
+        if (!peripherals.containsKey(macAddress) && BluetoothAdapter.checkBluetoothAddress(macAddress)) {
             BluetoothDevice device = BLECentralPlugin.this.bluetoothAdapter.getRemoteDevice(macAddress);
             Peripheral peripheral = new Peripheral(device);
             peripherals.put(macAddress, peripheral);
@@ -732,6 +764,7 @@ public class BLECentralPlugin extends CordovaPlugin {
 
     }
 
+    @SuppressLint("MissingPermission")
     private void autoConnect(CallbackContext callbackContext, String macAddress) {
 
         if (COMPILE_SDK_VERSION >= 31 && Build.VERSION.SDK_INT >= 31) { // (API 31) Build.VERSION_CODE.S
@@ -769,6 +802,7 @@ public class BLECentralPlugin extends CordovaPlugin {
 
     }
 
+    @SuppressLint("MissingPermission")
     private void disconnect(CallbackContext callbackContext, String macAddress) {
 
         Peripheral peripheral = peripherals.get(macAddress);
@@ -786,7 +820,7 @@ public class BLECentralPlugin extends CordovaPlugin {
     private void queueCleanup(CallbackContext callbackContext, String macAddress) {
         Peripheral peripheral = peripherals.get(macAddress);
         if (peripheral != null) {
-            peripheral.queueCleanup();
+            peripheral.queueCleanup("Aborted due to queue cleanup");
         }
         callbackContext.success();
     }
@@ -800,12 +834,20 @@ public class BLECentralPlugin extends CordovaPlugin {
             }
 
             broadCastReceiver = new BroadcastReceiver() {
+                @SuppressLint("MissingPermission")
                 @Override
                 public void onReceive(Context context, Intent intent) {
                     String action = intent.getAction();
 
                     if (BluetoothDevice.ACTION_PAIRING_REQUEST.equals(action)) {
-                        BluetoothDevice bluetoothDevice = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                        BluetoothDevice bluetoothDevice;
+                        if (Build.VERSION.SDK_INT >= 33) {
+                            bluetoothDevice = intent.getParcelableExtra(
+                                    BluetoothDevice.EXTRA_DEVICE,
+                                    android.bluetooth.BluetoothDevice.class);
+                        } else {
+                            bluetoothDevice = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                        }
                         int type = intent.getIntExtra(BluetoothDevice.EXTRA_PAIRING_VARIANT, BluetoothDevice.ERROR);
 
                         if (type == BluetoothDevice.PAIRING_VARIANT_PIN) {
@@ -827,10 +869,95 @@ public class BLECentralPlugin extends CordovaPlugin {
         }
     }
 
+    @SuppressLint("MissingPermission")
+    private void bond(CallbackContext callbackContext, String macAddress, boolean usePairingDialog) {
+        if (COMPILE_SDK_VERSION >= 31 && Build.VERSION.SDK_INT >= 31) { // (API 31) Build.VERSION_CODE.S
+            List<String> missingPermissions = new ArrayList<String>();
+            if (!PermissionHelper.hasPermission(this, BLUETOOTH_CONNECT)) {
+                missingPermissions.add(BLUETOOTH_CONNECT);
+            }
+            if (usePairingDialog && !PermissionHelper.hasPermission(this, BLUETOOTH_SCAN)) {
+                missingPermissions.add(BLUETOOTH_SCAN);
+            }
+            if (!missingPermissions.isEmpty()) {
+                permissionCallback = callbackContext;
+                deviceMacAddress = macAddress;
+                this.usePairingDialog = usePairingDialog;
+                PermissionHelper.requestPermissions(this, REQUEST_BOND, missingPermissions.toArray(new String[0]));
+                return;
+            }
+        }
+
+        if (!peripherals.containsKey(macAddress) && BluetoothAdapter.checkBluetoothAddress(macAddress)) {
+            BluetoothDevice device = BLECentralPlugin.this.bluetoothAdapter.getRemoteDevice(macAddress);
+            Peripheral peripheral = new Peripheral(device);
+            peripherals.put(macAddress, peripheral);
+        }
+
+        Peripheral peripheral = peripherals.get(macAddress);
+        if (peripheral != null) {
+            addBondStateListener();
+            peripheral.bond(callbackContext, bluetoothAdapter, usePairingDialog);
+        } else {
+            callbackContext.error("Peripheral " + macAddress + " not found.");
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private void unbond(CallbackContext callbackContext, String macAddress) {
+        if (COMPILE_SDK_VERSION >= 31 && Build.VERSION.SDK_INT >= 31) { // (API 31) Build.VERSION_CODE.S
+            if (!PermissionHelper.hasPermission(this, BLUETOOTH_CONNECT)) {
+                permissionCallback = callbackContext;
+                deviceMacAddress = macAddress;
+                PermissionHelper.requestPermission(this, REQUEST_UNBOND, BLUETOOTH_CONNECT);
+                return;
+            }
+        }
+
+        if (!peripherals.containsKey(macAddress) && BluetoothAdapter.checkBluetoothAddress(macAddress)) {
+            BluetoothDevice device = BLECentralPlugin.this.bluetoothAdapter.getRemoteDevice(macAddress);
+            Peripheral peripheral = new Peripheral(device);
+            peripherals.put(macAddress, peripheral);
+        }
+
+        Peripheral peripheral = peripherals.get(macAddress);
+        if (peripheral != null) {
+            peripheral.unbond(callbackContext);
+        } else {
+            callbackContext.success();
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private void readBondState(CallbackContext callbackContext, String macAddress) {
+        if (COMPILE_SDK_VERSION >= 31 && Build.VERSION.SDK_INT >= 31) { // (API 31) Build.VERSION_CODE.S
+            if (!PermissionHelper.hasPermission(this, BLUETOOTH_CONNECT)) {
+                permissionCallback = callbackContext;
+                deviceMacAddress = macAddress;
+                PermissionHelper.requestPermission(this, REQUEST_READ_BOND_STATE, BLUETOOTH_CONNECT);
+                return;
+            }
+        }
+
+        if (!peripherals.containsKey(macAddress) && BluetoothAdapter.checkBluetoothAddress(macAddress)) {
+            BluetoothDevice device = BLECentralPlugin.this.bluetoothAdapter.getRemoteDevice(macAddress);
+            Peripheral peripheral = new Peripheral(device);
+            peripherals.put(macAddress, peripheral);
+        }
+
+        Peripheral peripheral = peripherals.get(macAddress);
+        if (peripheral != null) {
+            peripheral.readBondState(callbackContext);
+        } else {
+            callbackContext.error("Peripheral " + macAddress + " not found.");
+        }
+    }
+
+    @SuppressLint("MissingPermission")
     private void requestMtu(CallbackContext callbackContext, String macAddress, int mtuValue) {
         Peripheral peripheral = peripherals.get(macAddress);
         if (peripheral != null) {
-            peripheral.requestMtu(callbackContext, mtuValue);
+            peripheral.queueRequestMtu(callbackContext, mtuValue);
         } else {
             String message = "Peripheral " + macAddress + " not found.";
             LOG.w(TAG, message);
@@ -838,6 +965,7 @@ public class BLECentralPlugin extends CordovaPlugin {
         }
     }
 
+    @SuppressLint("MissingPermission")
     private void requestConnectionPriority(CallbackContext callbackContext, String macAddress, String priority) {
         Peripheral peripheral = peripherals.get(macAddress);
 
@@ -859,8 +987,7 @@ public class BLECentralPlugin extends CordovaPlugin {
         } else if (priority.equals(CONNECTION_PRIORITY_HIGH)) {
             androidPriority = BluetoothGatt.CONNECTION_PRIORITY_HIGH;
         }
-        peripheral.requestConnectionPriority(androidPriority);
-        callbackContext.success();
+        peripheral.queueRequestConnectionPriority(callbackContext, androidPriority);
     }
 
     private void refreshDeviceCache(CallbackContext callbackContext, String macAddress, long timeoutMillis) {
@@ -931,6 +1058,7 @@ public class BLECentralPlugin extends CordovaPlugin {
 
     }
 
+    @SuppressLint("MissingPermission")
     private void connectL2cap(CallbackContext callbackContext, String macAddress, int psm, boolean secureChannel) {
         Peripheral peripheral = peripherals.get(macAddress);
         if (peripheral == null) {
@@ -1030,6 +1158,7 @@ public class BLECentralPlugin extends CordovaPlugin {
     }
 
     private ScanCallback leScanCallback = new ScanCallback() {
+        @SuppressLint("MissingPermission")
         @Override
         public void onScanResult(int callbackType, ScanResult result) {
             LOG.w(TAG, "Scan Result");
@@ -1039,8 +1168,12 @@ public class BLECentralPlugin extends CordovaPlugin {
             boolean alreadyReported = peripherals.containsKey(address) && !peripherals.get(address).isUnscanned();
 
             if (!alreadyReported) {
+                Boolean isConnectable = null;
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    isConnectable = result.isConnectable();
+                }
 
-                Peripheral peripheral = new Peripheral(device, result.getRssi(), result.getScanRecord().getBytes());
+                Peripheral peripheral = new Peripheral(device, result.getRssi(), result.getScanRecord().getBytes(), isConnectable);
                 peripherals.put(device.getAddress(), peripheral);
 
                 if (discoverCallback != null) {
@@ -1052,7 +1185,11 @@ public class BLECentralPlugin extends CordovaPlugin {
             } else {
                 Peripheral peripheral = peripherals.get(address);
                 if (peripheral != null) {
-                    peripheral.update(result.getRssi(), result.getScanRecord().getBytes());
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        peripheral.update(result.getRssi(), result.getScanRecord().getBytes(),result.isConnectable());
+                    }else{
+                        peripheral.update(result.getRssi(), result.getScanRecord().getBytes());
+                    }
                     if (reportDuplicates && discoverCallback != null) {
                         PluginResult pluginResult = new PluginResult(PluginResult.Status.OK, peripheral.asJSONObject());
                         pluginResult.setKeepCallback(true);
@@ -1074,10 +1211,7 @@ public class BLECentralPlugin extends CordovaPlugin {
     };
 
 
-    private void findLowEnergyDevices(CallbackContext callbackContext, UUID[] serviceUUIDs, int scanSeconds) {
-        findLowEnergyDevices( callbackContext, serviceUUIDs, scanSeconds, new ScanSettings.Builder().build() );
-    }
-
+    @SuppressLint("MissingPermission")
     private void findLowEnergyDevices(CallbackContext callbackContext, UUID[] serviceUUIDs, int scanSeconds, ScanSettings scanSettings) {
 
         if (!locationServicesEnabled() && Build.VERSION.SDK_INT < 31) {
@@ -1100,7 +1234,7 @@ public class BLECentralPlugin extends CordovaPlugin {
                 missingPermissions.add(Manifest.permission.ACCESS_FINE_LOCATION);
             } else {
                 String accessBackgroundLocation = this.preferences.getString("accessBackgroundLocation", "false");
-                if (accessBackgroundLocation == "true" &&  !PermissionHelper.hasPermission(this, ACCESS_BACKGROUND_LOCATION)) {
+                if (accessBackgroundLocation.equals("true") &&  !PermissionHelper.hasPermission(this, ACCESS_BACKGROUND_LOCATION)) {
                     LOG.w(TAG, "ACCESS_BACKGROUND_LOCATION is being requested");
                     missingPermissions.add(ACCESS_BACKGROUND_LOCATION);
                 }
@@ -1111,7 +1245,7 @@ public class BLECentralPlugin extends CordovaPlugin {
             }
 
             String accessBackgroundLocation = this.preferences.getString("accessBackgroundLocation", "false");
-            if (accessBackgroundLocation == "true" &&  !PermissionHelper.hasPermission(this, ACCESS_BACKGROUND_LOCATION)) {
+            if (accessBackgroundLocation.equals("true") &&  !PermissionHelper.hasPermission(this, ACCESS_BACKGROUND_LOCATION)) {
                 LOG.w(TAG, "ACCESS_BACKGROUND_LOCATION is being requested");
                 missingPermissions.add(ACCESS_BACKGROUND_LOCATION);
             }
@@ -1138,13 +1272,6 @@ public class BLECentralPlugin extends CordovaPlugin {
             return;
         }
 
-        // return error if already scanning
-        if (bluetoothAdapter.isDiscovering()) {
-            LOG.w(TAG, "Tried to start scan while already running.");
-            callbackContext.error("Tried to start scan while already running.");
-            return;
-        }
-
         // clear non-connected cached peripherals
         for(Iterator<Map.Entry<String, Peripheral>> iterator = peripherals.entrySet().iterator(); iterator.hasNext(); ) {
             Map.Entry<String, Peripheral> entry = iterator.next();
@@ -1167,12 +1294,16 @@ public class BLECentralPlugin extends CordovaPlugin {
                         new ParcelUuid(uuid)).build();
                 filters.add(filter);
             }
+        } else if (this.forceScanFilter) {
+            ScanFilter filter = new ScanFilter.Builder().build();
+            filters.add(filter);
         }
-        stopScanHandler.removeCallbacks(this::stopScan);
+
+        stopScanHandler.removeCallbacks(stopScanRunnable);
         bluetoothLeScanner.startScan(filters, scanSettings, leScanCallback);
 
         if (scanSeconds > 0) {
-            stopScanHandler.postDelayed(this::stopScan, scanSeconds * 1000);
+            stopScanHandler.postDelayed(stopScanRunnable, scanSeconds * 1000);
         }
 
         PluginResult result = new PluginResult(PluginResult.Status.NO_RESULT);
@@ -1180,13 +1311,14 @@ public class BLECentralPlugin extends CordovaPlugin {
         callbackContext.sendPluginResult(result);
     }
 
+    @SuppressLint("MissingPermission")
     private void stopScan() {
-        stopScanHandler.removeCallbacks(this::stopScan);
+        stopScanHandler.removeCallbacks(stopScanRunnable);
         if (bluetoothAdapter.getState() == BluetoothAdapter.STATE_ON) {
             LOG.d(TAG, "Stopping Scan");
             try {
                 final BluetoothLeScanner bluetoothLeScanner = bluetoothAdapter.getBluetoothLeScanner();
-                if (bluetoothLeScanner != null) 
+                if (bluetoothLeScanner != null)
                     bluetoothLeScanner.stopScan(leScanCallback);
             } catch (Exception e) {
                 LOG.e(TAG, "Exception stopping scan", e);
@@ -1204,6 +1336,7 @@ public class BLECentralPlugin extends CordovaPlugin {
         return (locationMode > 0);
     }
 
+    @SuppressLint("MissingPermission")
     private void listKnownDevices(CallbackContext callbackContext) {
         if (COMPILE_SDK_VERSION >= 31 && Build.VERSION.SDK_INT >= 31) { // (API 31) Build.VERSION_CODE.S
             if (!PermissionHelper.hasPermission(this, BLUETOOTH_CONNECT)) {
@@ -1326,6 +1459,25 @@ public class BLECentralPlugin extends CordovaPlugin {
                 LOG.d(TAG, "User granted permissions for list known devices");
                 listKnownDevices(callback);
                 break;
+
+            case REQUEST_BOND:
+                LOG.d(TAG, "User granted permissions for bond");
+                bond(callback, deviceMacAddress, usePairingDialog);
+                this.deviceMacAddress = null;
+                this.usePairingDialog = true;
+                break;
+
+            case REQUEST_UNBOND:
+                LOG.d(TAG, "User granted permissions for unbond");
+                unbond(callback, deviceMacAddress);
+                this.deviceMacAddress = null;
+                break;
+
+            case REQUEST_READ_BOND_STATE:
+                LOG.d(TAG, "User granted permissions for read bond state");
+                readBondState(callback, deviceMacAddress);
+                this.deviceMacAddress = null;
+                break;
         }
     }
 
@@ -1344,6 +1496,52 @@ public class BLECentralPlugin extends CordovaPlugin {
      */
     private void resetScanOptions() {
         this.reportDuplicates = false;
+        this.forceScanFilter = false;
     }
 
+    private void addBondStateListener() {
+        if (bondStateReceiver == null) {
+            bondStateReceiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    final String action = intent.getAction();
+                    if (ACTION_BOND_STATE_CHANGED.equals(action)) {
+                        BluetoothDevice device;
+                        if (Build.VERSION.SDK_INT >= 33) {
+                            device = intent.getParcelableExtra(
+                                    BluetoothDevice.EXTRA_DEVICE,
+                                    android.bluetooth.BluetoothDevice.class);
+                        } else {
+                            device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                        }
+                        Peripheral peripheral = device != null ? peripherals.get(device.getAddress()) : null;
+
+                        if (peripheral != null) {
+                            int bondState = intent.getIntExtra(EXTRA_BOND_STATE, BluetoothDevice.ERROR);
+                            int previousBondState = intent.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, -1);
+                            peripheral.updateBondState(bondState, previousBondState);
+                        }
+                    }
+                }
+            };
+            webView.getContext().registerReceiver(bondStateReceiver, new IntentFilter(ACTION_BOND_STATE_CHANGED));
+        }
+    }
+
+    private void removeBondStateListener() {
+        if (bondStateReceiver != null) {
+            webView.getContext().unregisterReceiver(bondStateReceiver);
+            bondStateReceiver = null;
+        }
+    }
+
+    @SuppressLint({"UnspecifiedRegisterReceiverFlag", "WrongConstant"})
+    private void registerNonSystemReceiverCompat(BroadcastReceiver receiver, IntentFilter filter) {
+        Context context = webView.getContext();
+        if (Build.VERSION.SDK_INT >= 34 /*14*/) {
+            context.registerReceiver(receiver, filter, 2); // // Context.RECEIVER_EXPORTED
+        } else {
+            context.registerReceiver(receiver, filter);
+        }
+    }
 }
