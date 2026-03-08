@@ -14,6 +14,8 @@
 
 package com.megster.cordova.ble.central;
 
+import android.annotation.SuppressLint;
+import android.annotation.TargetApi;
 import android.app.Activity;
 
 import android.bluetooth.*;
@@ -33,6 +35,10 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.lang.reflect.Method;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import androidx.annotation.NonNull;
+import androidx.annotation.RequiresApi;
+import androidx.annotation.RequiresPermission;
+
 /**
  * Peripheral wraps the BluetoothDevice and provides methods to convert to JSON.
  */
@@ -42,16 +48,22 @@ public class Peripheral extends BluetoothGattCallback {
     //public final static UUID CLIENT_CHARACTERISTIC_CONFIGURATION_UUID = UUID.fromString("00002902-0000-1000-8000-00805F9B34FB");
     public final static UUID CLIENT_CHARACTERISTIC_CONFIGURATION_UUID = UUIDHelper.uuidFromString("2902");
     private static final String TAG = "Peripheral";
+    private final static Map<Integer, String> bondStates = new Hashtable<Integer, String>() {{
+        put(BluetoothDevice.BOND_NONE, "none");
+        put(BluetoothDevice.BOND_BONDING, "bonding");
+        put(BluetoothDevice.BOND_BONDED, "bonded");
+    }};
 
     private static final int FAKE_PERIPHERAL_RSSI = 0x7FFFFFFF;
 
-    private BluetoothDevice device;
+    private final BluetoothDevice device;
     private byte[] advertisingData;
+    private Boolean isConnectable = null;
     private int advertisingRSSI;
     private boolean autoconnect = false;
     private boolean connected = false;
     private boolean connecting = false;
-    private ConcurrentLinkedQueue<BLECommand> commandQueue = new ConcurrentLinkedQueue<BLECommand>();
+    private final ConcurrentLinkedQueue<BLECommand> commandQueue = new ConcurrentLinkedQueue<BLECommand>();
     private final Map<Integer, L2CAPContext> l2capContexts = new HashMap<Integer, L2CAPContext>();
     private final AtomicBoolean bleProcessing = new AtomicBoolean();
 
@@ -62,9 +74,10 @@ public class Peripheral extends BluetoothGattCallback {
     private CallbackContext readCallback;
     private CallbackContext writeCallback;
     private CallbackContext requestMtuCallback;
+    private CallbackContext bondStateCallback;
     private Activity currentActivity;
 
-    private Map<String, SequentialCallbackContext> notificationCallbacks = new HashMap<String, SequentialCallbackContext>();
+    private final Map<String, SequentialCallbackContext> notificationCallbacks = new HashMap<String, SequentialCallbackContext>();
 
     public Peripheral(BluetoothDevice device) {
 
@@ -76,41 +89,56 @@ public class Peripheral extends BluetoothGattCallback {
 
     }
 
-    public Peripheral(BluetoothDevice device, int advertisingRSSI, byte[] scanRecord) {
-
+    public Peripheral(BluetoothDevice device, int advertisingRSSI, byte[] scanRecord, Boolean isConnectable) {
         this.device = device;
         this.advertisingRSSI = advertisingRSSI;
         this.advertisingData = scanRecord;
-
+        this.isConnectable = isConnectable;
     }
 
-    private void gattConnect() {
+    private String gattRef(BluetoothGatt targetGatt) {
+        return targetGatt == null ? "null" : Integer.toHexString(System.identityHashCode(targetGatt));
+    }
+
+    private boolean isCurrentGatt(BluetoothGatt callbackGatt) {
+        synchronized (this) {
+            return this.gatt != null && this.gatt == callbackGatt;
+        }
+    }
+
+    @RequiresPermission("android.permission.BLUETOOTH_CONNECT")
+    private boolean gattConnect() {
 
         closeGatt();
         connected = false;
         connecting = true;
-        queueCleanup();
-        callbackCleanup();
+        queueCleanup("Aborted by new connect call");
+        callbackCleanup("Aborted by new connect call");
 
         BluetoothDevice device = getDevice();
-        if (Build.VERSION.SDK_INT < 23) {
-            gatt = device.connectGatt(currentActivity, autoconnect, this);
-        } else {
-            gatt = device.connectGatt(currentActivity, autoconnect, this, BluetoothDevice.TRANSPORT_LE);
+        BluetoothGatt newGatt = device.connectGatt(currentActivity, autoconnect, this, BluetoothDevice.TRANSPORT_LE);
+        synchronized (this) {
+            gatt = newGatt;
         }
-
+        if (newGatt == null) {
+            LOG.e(TAG, "connectGatt returned null");
+            connecting = false;
+            return false;
+        }
+        LOG.d(TAG, "connectGatt started gatt=%s autoconnect=%s", gattRef(newGatt), autoconnect);
+        return true;
     }
 
+    @RequiresPermission("android.permission.BLUETOOTH_CONNECT")
     public void connect(CallbackContext callbackContext, Activity activity, boolean auto) {
         currentActivity = activity;
         autoconnect = auto;
         connectCallback = callbackContext;
-        if (refreshCallback != null) {
-            refreshCallback.error(this.asJSONObject("refreshDeviceCache aborted due to new connect call"));
-            refreshCallback = null;
+        if (!gattConnect()) {
+            connectCallback = null;
+            callbackContext.error("connectGatt returned null");
+            return;
         }
-
-        gattConnect();
 
         PluginResult result = new PluginResult(PluginResult.Status.NO_RESULT);
         result.setKeepCallback(true);
@@ -119,18 +147,20 @@ public class Peripheral extends BluetoothGattCallback {
 
     // the app requested the central disconnect from the peripheral
     // disconnect the gatt, do not call connectCallback.error
+    @RequiresPermission("android.permission.BLUETOOTH_CONNECT")
     public void disconnect() {
         connected = false;
         connecting = false;
         autoconnect = false;
 
         closeGatt();
-        queueCleanup();
-        callbackCleanup();
+        queueCleanup("Central disconnected");
+        callbackCleanup("Central disconnected");
     }
 
     // the peripheral disconnected
     // always call connectCallback.error to notify the app
+    @RequiresPermission("android.permission.BLUETOOTH_CONNECT")
     public void peripheralDisconnected(String message) {
         connected = false;
         connecting = false;
@@ -142,10 +172,11 @@ public class Peripheral extends BluetoothGattCallback {
 
         sendDisconnectMessage(message);
 
-        queueCleanup();
-        callbackCleanup();
+        queueCleanup(message);
+        callbackCleanup(message);
     }
 
+    @RequiresPermission("android.permission.BLUETOOTH_CONNECT")
     private void closeGatt() {
         BluetoothGatt localGatt;
         synchronized (this) {
@@ -159,6 +190,7 @@ public class Peripheral extends BluetoothGattCallback {
     }
 
     // notify the phone that the peripheral disconnected
+    @RequiresPermission("android.permission.BLUETOOTH_CONNECT")
     private void sendDisconnectMessage(String messageContent) {
         if (connectCallback != null) {
             JSONObject message = this.asJSONObject(messageContent);
@@ -176,48 +208,72 @@ public class Peripheral extends BluetoothGattCallback {
     @Override
     public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
         super.onMtuChanged(gatt, mtu, status);
-        LOG.d(TAG, "mtu=%d, status=%d", mtu, status);
-
-        if (status == BluetoothGatt.GATT_SUCCESS) {
-            requestMtuCallback.success(mtu);
-        } else {
-            requestMtuCallback.error("MTU request failed");
+        if (!isCurrentGatt(gatt)) {
+            LOG.w(TAG, "Ignoring stale onMtuChanged gatt=%s current=%s", gattRef(gatt), gattRef(this.gatt));
+            return;
         }
-        requestMtuCallback = null;
+
+        CallbackContext callback;
+        synchronized (this) {
+            callback = requestMtuCallback;
+            requestMtuCallback = null;
+        }
+
+        LOG.d(TAG, "mtu=%d, status=%d, gatt=%s", mtu, status, gattRef(gatt));
+        if (callback != null) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                callback.success(mtu);
+            } else {
+                callback.error("MTU request failed status=" + status);
+            }
+            commandCompleted();
+        } else {
+            LOG.w(TAG, "MTU callback missing for gatt=%s", gattRef(gatt));
+        }
     }
 
-    public void requestMtu(CallbackContext callback, int mtuValue) {
+    @RequiresPermission("android.permission.BLUETOOTH_CONNECT")
+    private void requestMtu(CallbackContext callback, int mtuValue) {
         LOG.d(TAG, "requestMtu mtu=%d", mtuValue);
         if (gatt == null) {
             callback.error("No GATT");
-            return;
-        }
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
-            callback.error("Android version does not support requestMtu");
+            commandCompleted();
             return;
         }
 
-        if (gatt.requestMtu(mtuValue)) {
+        synchronized (this) {
             requestMtuCallback = callback;
-        } else {
-            callback.error("Could not initiate MTU request");
+            if (!gatt.requestMtu(mtuValue)) {
+                requestMtuCallback = null;
+                callback.error("Could not initiate MTU request");
+                commandCompleted();
+            }
         }
     }
 
-    public void requestConnectionPriority(int priority) {
-        if (gatt != null) {
-            LOG.d(TAG, "requestConnectionPriority priority=" + priority);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                gatt.requestConnectionPriority(priority);
-            }
+    @RequiresPermission("android.permission.BLUETOOTH_CONNECT")
+    private void requestConnectionPriority(CallbackContext callbackContext, int priority) {
+        if (gatt == null) {
+            callbackContext.error("No GATT");
+            commandCompleted();
+            return;
         }
+
+        LOG.d(TAG, "requestConnectionPriority priority=%d gatt=%s", priority, gattRef(gatt));
+        boolean success = gatt.requestConnectionPriority(priority);
+        if (success) {
+            callbackContext.success();
+        } else {
+            callbackContext.error("Could not initiate connection priority request");
+        }
+        commandCompleted();
     }
 
     /**
      * Uses reflection to refresh the device cache. This *might* be helpful if a peripheral changes
      * services or characteristics and does not correctly implement Service Changed 0x2a05
      * on Generic Attribute Service 0x1801.
-     *
+     * <p>
      * Since this uses an undocumented API it's not guaranteed to work.
      *
      */
@@ -235,6 +291,7 @@ public class Peripheral extends BluetoothGattCallback {
                         Handler handler = new Handler();
                         LOG.d(TAG, "Waiting " + timeoutMillis + " milliseconds before discovering services");
                         handler.postDelayed(new Runnable() {
+                            @SuppressLint("MissingPermission")
                             @Override
                             public void run() {
                                 if (gatt != null) {
@@ -264,6 +321,7 @@ public class Peripheral extends BluetoothGattCallback {
         return advertisingData == null;
     }
 
+    @RequiresPermission("android.permission.BLUETOOTH_CONNECT")
     public JSONObject asJSONObject()  {
 
         JSONObject json = new JSONObject();
@@ -278,6 +336,10 @@ public class Peripheral extends BluetoothGattCallback {
             if (advertisingRSSI != FAKE_PERIPHERAL_RSSI) {
                 json.put("rssi", advertisingRSSI);
             }
+
+            if (this.isConnectable != null) {
+                json.put("connectable", this.isConnectable.booleanValue());
+            }
         } catch (JSONException e) { // this shouldn't happen
             e.printStackTrace();
         }
@@ -285,6 +347,7 @@ public class Peripheral extends BluetoothGattCallback {
         return json;
     }
 
+    @RequiresPermission("android.permission.BLUETOOTH_CONNECT")
     public JSONObject asJSONObject(String errorMessage)  {
 
         JSONObject json = new JSONObject();
@@ -300,6 +363,7 @@ public class Peripheral extends BluetoothGattCallback {
         return json;
     }
 
+    @RequiresPermission("android.permission.BLUETOOTH_CONNECT")
     public JSONObject asJSONObject(BluetoothGatt gatt) {
 
         JSONObject json = asJSONObject();
@@ -375,20 +439,25 @@ public class Peripheral extends BluetoothGattCallback {
         return device;
     }
 
+    @SuppressLint("MissingPermission")
     @Override
     public void onServicesDiscovered(BluetoothGatt gatt, int status) {
         super.onServicesDiscovered(gatt, status);
+        if (!isCurrentGatt(gatt)) {
+            LOG.w(TAG, "Ignoring stale onServicesDiscovered gatt=%s current=%s", gattRef(gatt), gattRef(this.gatt));
+            return;
+        }
 
         // refreshCallback is a kludge for refreshing services, if it exists, it temporarily
         // overrides the connect callback. Unfortunately this edge case make the code confusing.
 
         if (status == BluetoothGatt.GATT_SUCCESS) {
             PluginResult result = new PluginResult(PluginResult.Status.OK, this.asJSONObject(gatt));
-            result.setKeepCallback(true);
             if (refreshCallback != null) {
                 refreshCallback.sendPluginResult(result);
                 refreshCallback = null;
             } else if (connectCallback != null) {
+                result.setKeepCallback(true);
                 connectCallback.sendPluginResult(result);
             }
         } else {
@@ -396,35 +465,53 @@ public class Peripheral extends BluetoothGattCallback {
             if (refreshCallback != null) {
                 refreshCallback.error(this.asJSONObject("Service discovery failed"));
                 refreshCallback = null;
+            } else {
+                peripheralDisconnected("Service discovery failed");
             }
-
-            peripheralDisconnected("Service discovery failed");
         }
     }
 
+    @SuppressLint("MissingPermission")
     @Override
     public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
+        if (!isCurrentGatt(gatt)) {
+            LOG.w(TAG, "Ignoring stale onConnectionStateChange status=%d state=%d gatt=%s current=%s",
+                status, newState, gattRef(gatt), gattRef(this.gatt));
+            return;
+        }
 
-        this.gatt = gatt;
-
-        if (newState == BluetoothGatt.STATE_CONNECTED) {
-            LOG.d(TAG, "onConnectionStateChange CONNECTED");
+        if (newState == BluetoothGatt.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
+            LOG.d(TAG, "onConnectionStateChange CONNECTED status=%d gatt=%s", status, gattRef(gatt));
             connected = true;
             connecting = false;
-            gatt.discoverServices();
+            if (!gatt.discoverServices()) {
+                LOG.e(TAG, "discoverServices failed gatt=%s", gattRef(gatt));
+                peripheralDisconnected("Service discovery start failed");
+            }
 
         } else {  // Disconnected
-            LOG.d(TAG, "onConnectionStateChange DISCONNECTED");
+            LOG.d(TAG, "onConnectionStateChange DISCONNECTED status=%d state=%d gatt=%s",
+                status, newState, gattRef(gatt));
             connected = false;
-            peripheralDisconnected("Peripheral Disconnected");
+            peripheralDisconnected("Peripheral Disconnected status=" + status + " state=" + newState);
 
         }
 
     }
 
+    @TargetApi(32 /*S_V2*/)
     @Override
     public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
         super.onCharacteristicChanged(gatt, characteristic);
+        if (Build.VERSION.SDK_INT >= 33) {
+            // handled by new callback below
+            return;
+        }
+        if (!isCurrentGatt(gatt)) {
+            LOG.w(TAG, "Ignoring stale onCharacteristicChanged gatt=%s current=%s", gattRef(gatt), gattRef(this.gatt));
+            return;
+        }
+
         LOG.d(TAG, "onCharacteristicChanged %s", characteristic);
 
         SequentialCallbackContext callback = notificationCallbacks.get(generateHashKey(characteristic));
@@ -434,9 +521,36 @@ public class Peripheral extends BluetoothGattCallback {
         }
     }
 
+    @RequiresApi(api = 33 /*TIRAMISU*/)
+    @Override
+    public void onCharacteristicChanged(@NonNull BluetoothGatt gatt, @NonNull BluetoothGattCharacteristic characteristic, @NonNull byte[] data) {
+        super.onCharacteristicChanged(gatt, characteristic, data);
+        if (!isCurrentGatt(gatt)) {
+            LOG.w(TAG, "Ignoring stale onCharacteristicChanged(api33) gatt=%s current=%s", gattRef(gatt), gattRef(this.gatt));
+            return;
+        }
+        LOG.d(TAG, "onCharacteristicChanged (api:33) %s", characteristic);
+
+        SequentialCallbackContext callback = notificationCallbacks.get(generateHashKey(characteristic));
+
+        if (callback != null) {
+            callback.sendSequentialResult(data);
+        }
+    }
+
+    @TargetApi(32 /*S_V2*/)
     @Override
     public void onCharacteristicRead(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
         super.onCharacteristicRead(gatt, characteristic, status);
+        if (Build.VERSION.SDK_INT >= 33) {
+            // handled by new callback below
+            return;
+        }
+        if (!isCurrentGatt(gatt)) {
+            LOG.w(TAG, "Ignoring stale onCharacteristicRead gatt=%s current=%s", gattRef(gatt), gattRef(this.gatt));
+            return;
+        }
+
         LOG.d(TAG, "onCharacteristicRead %s", characteristic);
 
         synchronized(this) {
@@ -454,9 +568,38 @@ public class Peripheral extends BluetoothGattCallback {
         commandCompleted();
     }
 
+    @RequiresApi(api = 33 /*TIRAMISU*/)
+    @Override
+    public void onCharacteristicRead(@NonNull BluetoothGatt gatt, @NonNull BluetoothGattCharacteristic characteristic, @NonNull byte[] value, int status) {
+        super.onCharacteristicRead(gatt, characteristic, value, status);
+        if (!isCurrentGatt(gatt)) {
+            LOG.w(TAG, "Ignoring stale onCharacteristicRead(api33) gatt=%s current=%s", gattRef(gatt), gattRef(this.gatt));
+            return;
+        }
+        LOG.d(TAG, "onCharacteristicRead (api:33) %s", characteristic);
+
+        synchronized(this) {
+            if (readCallback != null) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    readCallback.success(value);
+                } else {
+                    readCallback.error("Error reading " + characteristic.getUuid() + " status=" + status);
+                }
+
+                readCallback = null;
+            }
+        }
+
+        commandCompleted();
+    }
+
     @Override
     public void onCharacteristicWrite(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
         super.onCharacteristicWrite(gatt, characteristic, status);
+        if (!isCurrentGatt(gatt)) {
+            LOG.w(TAG, "Ignoring stale onCharacteristicWrite gatt=%s current=%s", gattRef(gatt), gattRef(this.gatt));
+            return;
+        }
         LOG.d(TAG, "onCharacteristicWrite %s", characteristic);
 
         synchronized(this) {
@@ -477,6 +620,10 @@ public class Peripheral extends BluetoothGattCallback {
     @Override
     public void onDescriptorWrite(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
         super.onDescriptorWrite(gatt, descriptor, status);
+        if (!isCurrentGatt(gatt)) {
+            LOG.w(TAG, "Ignoring stale onDescriptorWrite gatt=%s current=%s", gattRef(gatt), gattRef(this.gatt));
+            return;
+        }
         LOG.d(TAG, "onDescriptorWrite %s", descriptor);
         if (descriptor.getUuid().equals(CLIENT_CHARACTERISTIC_CONFIGURATION_UUID)) {
             BluetoothGattCharacteristic characteristic = descriptor.getCharacteristic();
@@ -497,6 +644,10 @@ public class Peripheral extends BluetoothGattCallback {
     @Override
     public void onReadRemoteRssi(BluetoothGatt gatt, int rssi, int status) {
         super.onReadRemoteRssi(gatt, rssi, status);
+        if (!isCurrentGatt(gatt)) {
+            LOG.w(TAG, "Ignoring stale onReadRemoteRssi gatt=%s current=%s", gattRef(gatt), gattRef(this.gatt));
+            return;
+        }
         synchronized(this) {
             if (readCallback != null) {
                 if (status == BluetoothGatt.GATT_SUCCESS) {
@@ -513,16 +664,25 @@ public class Peripheral extends BluetoothGattCallback {
     }
 
     // Update rssi and scanRecord.
+    public void update(int rssi, byte[] scanRecord, boolean isConnectable) {
+        this.advertisingRSSI = rssi;
+        this.advertisingData = scanRecord;
+        this.isConnectable = isConnectable;
+    }
+
+
     public void update(int rssi, byte[] scanRecord) {
         this.advertisingRSSI = rssi;
         this.advertisingData = scanRecord;
     }
+
 
     public void updateRssi(int rssi) {
         advertisingRSSI = rssi;
     }
 
     // This seems way too complicated
+    @RequiresPermission("android.permission.BLUETOOTH_CONNECT")
     private void registerNotifyCallback(CallbackContext callbackContext, UUID serviceUUID, UUID characteristicUUID) {
 
         if (gatt == null) {
@@ -569,22 +729,41 @@ public class Peripheral extends BluetoothGattCallback {
             return;
         }
 
+        byte[] value;
         // prefer notify over indicate
         if ((characteristic.getProperties() & BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0) {
-            descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+            value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE;
         } else if ((characteristic.getProperties() & BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0) {
-            descriptor.setValue(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE);
+            value = BluetoothGattDescriptor.ENABLE_INDICATION_VALUE;
         } else {
             LOG.w(TAG, "Characteristic %s does not have NOTIFY or INDICATE property set", characteristicUUID);
+            callbackContext.error("Set notification failed for " + characteristicUUID + "(missing NOTIFY or INDICATE property)");
+            notificationCallbacks.remove(key);
+            commandCompleted();
+            return;
         }
 
-        if (!gatt.writeDescriptor(descriptor)) {
-            callbackContext.error("Failed to set client characteristic notification for " + characteristicUUID);
+        if (Build.VERSION.SDK_INT >= 33) {
+            int status = gatt.writeDescriptor(descriptor, value);
+            success = status == BluetoothStatusCodes.SUCCESS;
+            if (!success) {
+                callbackContext.error("Failed to set client characteristic notification for " + characteristicUUID + " (status code " + status + ")");
+            }
+        } else {
+            descriptor.setValue(value);
+            success = gatt.writeDescriptor(descriptor);
+            if (!success) {
+                callbackContext.error("Failed to set client characteristic notification for " + characteristicUUID);
+            }
+        }
+
+        if (!success) {
             notificationCallbacks.remove(key);
             commandCompleted();
         }
     }
 
+    @RequiresPermission("android.permission.BLUETOOTH_CONNECT")
     private void removeNotifyCallback(CallbackContext callbackContext, UUID serviceUUID, UUID characteristicUUID) {
 
         if (gatt == null) {
@@ -616,8 +795,12 @@ public class Peripheral extends BluetoothGattCallback {
         if (gatt.setCharacteristicNotification(characteristic, false)) {
             BluetoothGattDescriptor descriptor = characteristic.getDescriptor(CLIENT_CHARACTERISTIC_CONFIGURATION_UUID);
             if (descriptor != null) {
-                descriptor.setValue(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE);
-                gatt.writeDescriptor(descriptor);
+                if (Build.VERSION.SDK_INT >= 33) {
+                    gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE);
+                } else {
+                    descriptor.setValue(BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE);
+                    gatt.writeDescriptor(descriptor);
+                }
             }
             callbackContext.success();
         } else {
@@ -662,6 +845,7 @@ public class Peripheral extends BluetoothGattCallback {
         return characteristic;
     }
 
+    @RequiresPermission("android.permission.BLUETOOTH_CONNECT")
     private void readCharacteristic(CallbackContext callbackContext, UUID serviceUUID, UUID characteristicUUID) {
 
         if (gatt == null) {
@@ -704,6 +888,7 @@ public class Peripheral extends BluetoothGattCallback {
 
     }
 
+    @RequiresPermission("android.permission.BLUETOOTH_CONNECT")
     private void readRSSI(CallbackContext callbackContext) {
 
         if (gatt == null) {
@@ -754,6 +939,7 @@ public class Peripheral extends BluetoothGattCallback {
         return characteristic;
     }
 
+    @RequiresPermission("android.permission.BLUETOOTH_CONNECT")
     private void writeCharacteristic(CallbackContext callbackContext, UUID serviceUUID, UUID characteristicUUID, byte[] data, int writeType) {
 
         if (gatt == null) {
@@ -780,16 +966,25 @@ public class Peripheral extends BluetoothGattCallback {
 
         boolean success = false;
 
-        characteristic.setValue(data);
-        characteristic.setWriteType(writeType);
         synchronized(this) {
             writeCallback = callbackContext;
-
-            if (gatt.writeCharacteristic(characteristic)) {
-                success = true;
+            if (Build.VERSION.SDK_INT >= 33) {
+                int status = gatt.writeCharacteristic(characteristic, data, writeType);
+                success = status == BluetoothStatusCodes.SUCCESS;
+                if (!success) {
+                    LOG.d(TAG,"BLE Write failed: %s", status);
+                    writeCallback = null;
+                    callbackContext.error("Write failed with status code " + status);
+                }
             } else {
-                writeCallback = null;
-                callbackContext.error("Write failed");
+                characteristic.setValue(data);
+                characteristic.setWriteType(writeType);
+                success = gatt.writeCharacteristic(characteristic);
+                if (!success) {
+                    LOG.d(TAG,"BLE Write failed");
+                    writeCallback = null;
+                    callbackContext.error("Write failed");
+                }
             }
         }
 
@@ -852,10 +1047,20 @@ public class Peripheral extends BluetoothGattCallback {
         queueCommand(command);
     }
 
-    public void queueCleanup() {
+    public void queueRequestMtu(CallbackContext callbackContext, int mtuValue) {
+        BLECommand command = new BLECommand(callbackContext, null, null, mtuValue, BLECommand.REQUEST_MTU);
+        queueCommand(command);
+    }
+
+    public void queueRequestConnectionPriority(CallbackContext callbackContext, int priority) {
+        BLECommand command = new BLECommand(callbackContext, null, null, priority, BLECommand.REQUEST_CONNECTION_PRIORITY);
+        queueCommand(command);
+    }
+
+    public void queueCleanup(String message) {
         bleProcessing.set(true); // Stop anything else trying to process
         for (BLECommand command = commandQueue.poll(); command != null; command = commandQueue.poll()) {
-            command.getCallbackContext().error("Peripheral Disconnected");
+            command.getCallbackContext().error(message);
         }
         bleProcessing.set(false); // Now re-allow processing
 
@@ -873,16 +1078,26 @@ public class Peripheral extends BluetoothGattCallback {
         getOrAddL2CAPContext(psm).writeL2CapChannel(callbackContext, data);
     }
 
-    private void callbackCleanup() {
+    @SuppressLint("MissingPermission")
+    private void callbackCleanup(String message) {
         synchronized(this) {
             if (readCallback != null) {
-                readCallback.error(this.asJSONObject("Peripheral Disconnected"));
+                readCallback.error(this.asJSONObject(message));
                 readCallback = null;
                 commandCompleted();
             }
             if (writeCallback != null) {
-                writeCallback.error(this.asJSONObject("Peripheral Disconnected"));
+                writeCallback.error(this.asJSONObject(message));
                 writeCallback = null;
+                commandCompleted();
+            }
+            if (refreshCallback != null) {
+                refreshCallback.error(this.asJSONObject(message));
+                refreshCallback = null;
+            }
+            if (requestMtuCallback != null) {
+                requestMtuCallback.error(message);
+                requestMtuCallback = null;
                 commandCompleted();
             }
         }
@@ -901,6 +1116,7 @@ public class Peripheral extends BluetoothGattCallback {
     }
 
     // command finished, queue the next command
+    @SuppressLint("MissingPermission")
     private void commandCompleted() {
         LOG.d(TAG,"Processing Complete");
         bleProcessing.set(false);
@@ -908,6 +1124,7 @@ public class Peripheral extends BluetoothGattCallback {
     }
 
     // process the queue
+    @SuppressLint("MissingPermission")
     private void processCommands() {
         final boolean canProcess = bleProcessing.compareAndSet(false, true);
         if (!canProcess) { return; }
@@ -933,6 +1150,12 @@ public class Peripheral extends BluetoothGattCallback {
             } else if (command.getType() == BLECommand.READ_RSSI) {
                 LOG.d(TAG,"Read RSSI");
                 readRSSI(command.getCallbackContext());
+            } else if (command.getType() == BLECommand.REQUEST_MTU) {
+                LOG.d(TAG,"Request MTU %d", command.getIntData());
+                requestMtu(command.getCallbackContext(), command.getIntData());
+            } else if (command.getType() == BLECommand.REQUEST_CONNECTION_PRIORITY) {
+                LOG.d(TAG,"Request Connection Priority %d", command.getIntData());
+                requestConnectionPriority(command.getCallbackContext(), command.getIntData());
             } else {
                 // this shouldn't happen
                 bleProcessing.set(false);
@@ -953,6 +1176,7 @@ public class Peripheral extends BluetoothGattCallback {
         return serviceUUID + "|" + characteristic.getUuid() + "|" + characteristic.getInstanceId();
     }
 
+    @RequiresPermission("android.permission.BLUETOOTH_CONNECT")
     public void connectL2cap(CallbackContext callbackContext, int psm, boolean secureChannel) {
         getOrAddL2CAPContext(psm).connectL2cap(callbackContext, secureChannel);
     }
@@ -985,5 +1209,86 @@ public class Peripheral extends BluetoothGattCallback {
             }
             return context;
         }
+    }
+
+    @RequiresPermission(allOf = { "android.permission.BLUETOOTH_CONNECT", "android.permission.BLUETOOTH_SCAN" })
+    public void bond(CallbackContext callbackContext, BluetoothAdapter bluetoothAdapter, boolean usePairingDialog) {
+        if (bondStateCallback != null) {
+            bondStateCallback.error("Aborted by new bond call");
+            bondStateCallback = null;
+        }
+
+        int bondState = device.getBondState();
+        if (bondState == BluetoothDevice.BOND_BONDED) {
+            callbackContext.success();
+            return;
+        }
+
+        bondStateCallback = callbackContext;
+        if (bondState == BluetoothDevice.BOND_NONE) {
+            if (usePairingDialog) {
+                // Fake Bluetooth discovery so Android gives us a prompt rather than a crappy notification
+                // Source: https://stackoverflow.com/a/59881926
+                bluetoothAdapter.startDiscovery();
+                bluetoothAdapter.cancelDiscovery();
+            }
+            if (!device.createBond()) {
+                bondStateCallback = null;
+                callbackContext.error("createBond returned false");
+            }
+        }
+    }
+
+    @RequiresPermission("android.permission.BLUETOOTH_CONNECT")
+    public void unbond(CallbackContext callbackContext) {
+        final int bondState = device.getBondState();
+        if (bondState == BluetoothDevice.BOND_NONE) {
+            callbackContext.success();
+            return;
+        }
+
+        if (bondState != BluetoothDevice.BOND_BONDED) {
+            LOG.w(TAG, "Unbonding device in state %s", bondState);
+        }
+
+        try {
+            //noinspection JavaReflectionMemberAccess
+            final Method removeBond = device.getClass().getMethod("removeBond");
+            if (removeBond == null) {
+                LOG.w(TAG, "removeBond method not found on gatt");
+                callbackContext.error("removeBond method not found on gatt");
+                return;
+            }
+
+            if(removeBond.invoke(device) != Boolean.TRUE) {
+                LOG.w(TAG, "removeBond returned false");
+                callbackContext.error("removeBond returned false");
+                return;
+            }
+
+            callbackContext.success();
+        } catch (final Exception e) {
+            LOG.w(TAG, "removeBond threw an exception", e);
+            callbackContext.error("removeBond threw an exception: " + e.getMessage());
+        }
+    }
+
+    public void updateBondState(int bondState, int previousBondState) {
+        LOG.d(TAG, "Bonding state update %s => %s", previousBondState, bondState);
+        if (bondStateCallback == null) return;
+
+        if (bondState == BluetoothDevice.BOND_BONDED || bondState == BluetoothDevice.BOND_NONE) {
+            if (bondState == BluetoothDevice.BOND_BONDED) {
+                bondStateCallback.success();
+            } else {
+                bondStateCallback.error("Unsuccessful bond state: " + bondStates.get(bondState));
+            }
+            bondStateCallback = null;
+        }
+    }
+
+    @RequiresPermission("android.permission.BLUETOOTH_CONNECT")
+    public void readBondState(CallbackContext callbackContext) {
+        callbackContext.success(bondStates.get(device.getBondState()));
     }
 }
